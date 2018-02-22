@@ -1974,7 +1974,14 @@ public final class EnhancedQueueExecutor extends AbstractExecutorService impleme
     void safeRun(final Runnable task) {
         assert ! holdsLock(headLock) && ! holdsLock(tailLock);
         try {
-            if (task != null) task.run();
+            if (task != null) {
+                Thread.currentThread().setContextClassLoader(task.getClass().getClassLoader());
+                try {
+                    task.run();
+                } finally {
+                    Thread.currentThread().setContextClassLoader(getClass().getClassLoader());
+                }
+            }
         } catch (Throwable t) {
             try {
                 exceptionHandler.uncaughtException(Thread.currentThread(), t);
