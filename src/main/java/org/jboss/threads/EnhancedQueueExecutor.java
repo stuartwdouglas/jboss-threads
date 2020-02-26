@@ -23,7 +23,8 @@ import static java.lang.Math.min;
 import static java.lang.Thread.currentThread;
 import static java.security.AccessController.doPrivileged;
 import static java.security.AccessController.getContext;
-import static java.util.concurrent.locks.LockSupport.*;
+import static java.util.concurrent.locks.LockSupport.parkNanos;
+import static java.util.concurrent.locks.LockSupport.unpark;
 import static org.jboss.threads.JBossExecutors.unsafe;
 
 import java.lang.management.ManagementFactory;
@@ -39,13 +40,12 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.LockSupport;
 
 import javax.management.ObjectInstance;
 import javax.management.ObjectName;
@@ -53,10 +53,7 @@ import javax.management.ObjectName;
 import org.jboss.threads.management.ManageableThreadPoolExecutorService;
 import org.jboss.threads.management.StandardThreadPoolMXBean;
 import org.wildfly.common.Assert;
-import org.wildfly.common.cpu.ProcessorInfo;
 import org.wildfly.common.lock.ExtendedLock;
-import org.wildfly.common.lock.Locks;
-import org.wildfly.common.lock.SpinLock;
 
 /**
  * A task-or-thread queue backed thread pool executor service.  Tasks are added in a FIFO manner, and consumers in a LIFO manner.
@@ -130,11 +127,7 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
      */
     public static final boolean DISABLE_HINT = readBooleanPropertyPrefixed("disable", false);
 
-    /**
-     * Update the tail pointer opportunistically.
-     */
-    static final boolean UPDATE_TAIL = readBooleanPropertyPrefixed("update-tail", false);
-    /**
+   /**
      * Update the summary statistics.
      */
     static final boolean UPDATE_STATISTICS = readBooleanPropertyPrefixed("statistics", true);
@@ -150,14 +143,6 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
      * Set to enable or disable MBean registration.
      */
     static final boolean DISABLE_MBEAN = readBooleanPropertyPrefixed("disable-mbean", readProperty("org.graalvm.nativeimage.imagecode", null) != null);
-    /**
-     * The number of times a thread should spin/yield before actually parking.
-     */
-    static final int PARK_SPINS = readIntPropertyPrefixed("park-spins", ProcessorInfo.availableProcessors() == 1 ? 0 : 1 << 7);
-    /**
-     * The yield ratio expressed as the number of spins that should yield.
-     */
-    static final int YIELD_FACTOR = max(min(readIntPropertyPrefixed("park-yields", 1), PARK_SPINS), 0);
 
     // =======================================================
     // Constants
@@ -189,20 +174,6 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
      * The access control context of the creating thread.
      */
     private final AccessControlContext acc;
-
-    // =======================================================
-    // Locks
-    // =======================================================
-
-    /**
-     * The tail lock.  Only used if {@link #TAIL_LOCK} is {@code true}.
-     */
-    private final ExtendedLock tailLock = TAIL_LOCK ? TAIL_SPIN ? new SpinLock() : Locks.reentrantLock() : null;
-
-    /**
-     * The head lock.  Only used if {@link #HEAD_LOCK} is {@code true}.
-     */
-    private final ExtendedLock headLock = COMBINED_LOCK ? tailLock : HEAD_LOCK ? HEAD_SPIN ? new SpinLock() : Locks.reentrantLock() : null;
 
     // =======================================================
     // Current state fields
@@ -278,6 +249,8 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
     @SuppressWarnings("unused")
     volatile int activeCount;
 
+    private final LinkedTransferQueue<Runnable> queue = new LinkedTransferQueue<>();
+
     // =======================================================
     // Updaters
     // =======================================================
@@ -340,15 +313,9 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
     // Marker objects
     // =======================================================
 
-    static final QNode TERMINATE_REQUESTED = new TerminateWaiterNode();
-    static final QNode TERMINATE_COMPLETE = new TerminateWaiterNode();
-
     static final Waiter TERMINATE_COMPLETE_WAITER = new Waiter(null);
 
-    static final Runnable WAITING = new NullRunnable();
-    static final Runnable GAVE_UP = new NullRunnable();
-    static final Runnable ACCEPTED = new NullRunnable();
-    static final Runnable EXIT = new NullRunnable();
+    static final Runnable SHUTDOWN = new NullRunnable();
 
     // =======================================================
     // Constructor
@@ -762,17 +729,7 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
         Assert.checkNotNullParam("runnable", runnable);
         final Runnable realRunnable = JBossExecutors.classLoaderPreservingTaskUnchecked(runnable);
         int result;
-        if (TAIL_LOCK) {
-            Lock lock = this.tailLock;
-            lock.lock();
-            try {
-                result = tryExecute(realRunnable);
-            } finally {
-                lock.unlock();
-            }
-        } else {
             result = tryExecute(realRunnable);
-        }
         boolean ok = false;
         if (result == EXE_OK) {
             // last check to ensure that there is at least one existent thread to avoid rare thread timeout race condition
@@ -814,20 +771,11 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
     public List<Runnable> shutdownNow() {
         shutdown(true);
         final ArrayList<Runnable> list = new ArrayList<>();
-        TaskNode head = this.head;
-        QNode headNext;
         for (;;) {
-            headNext = head.getNext();
-            if (headNext instanceof TaskNode) {
-                TaskNode taskNode = (TaskNode) headNext;
-                if (compareAndSetHead(head, taskNode)) {
-                    if (! NO_QUEUE_LIMIT) decreaseQueueSize();
-                    head = taskNode;
-                    list.add(taskNode.task);
-                }
-                // retry
+            Runnable r = queue.poll();
+            if (r != null) {
+                list.add(r);
             } else {
-                // no more tasks;
                 return list;
             }
         }
@@ -937,57 +885,8 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
             if (currentSizeOf(oldStatus) == 0) newStatus = withShutdownComplete(newStatus);
             if (newStatus == oldStatus) return;
         } while (! compareAndSetThreadStatus(oldStatus, newStatus));
+        queue.offer(SHUTDOWN);
         assert oldStatus != newStatus;
-        if (isShutdownRequested(newStatus) != isShutdownRequested(oldStatus)) {
-            assert ! isShutdownRequested(oldStatus); // because it can only ever be set, not cleared
-            // we initiated shutdown
-            // clear out all consumers and append a dummy waiter node
-            TaskNode tail = this.tail;
-            QNode tailNext;
-            // a marker to indicate that termination was requested
-            for (;;) {
-                tailNext = tail.getNext();
-                if (tailNext instanceof TaskNode) {
-                    tail = (TaskNode) tailNext;
-                } else if (tailNext instanceof PoolThreadNode || tailNext == null) {
-                    // remove the entire chain from this point
-                    PoolThreadNode node = (PoolThreadNode) tailNext;
-                    // state change sh2:
-                    //   tail.next ← terminateNode(null)
-                    // succeeds: sh1
-                    // preconditions:
-                    //   threadStatus contains shutdown
-                    //   tail(snapshot) is a task node
-                    //   tail(snapshot).next is a (list of) pool thread node(s) or null
-                    // postconditions (succeed):
-                    //   tail(snapshot).next is TERMINATE_REQUESTED
-                    if (tail.compareAndSetNext(node, TERMINATE_REQUESTED)) {
-                        // got it!
-                        // state change sh3:
-                        //   node.task ← EXIT
-                        // preconditions:
-                        //   none (node task may be in any state)
-                        // postconditions (succeed):
-                        //   task is EXIT
-                        // postconditions (fail):
-                        //   no change (repeat loop)
-                        while (node != null) {
-                            node.compareAndSetTask(WAITING, EXIT);
-                            node.unpark();
-                            node = node.getNext();
-                        }
-                        // success; exit loop
-                        break;
-                    }
-                    // repeat loop (failed CAS)
-                } else if (tailNext instanceof TerminateWaiterNode) {
-                    // theoretically impossible, but it means we have nothing else to do
-                    break;
-                } else {
-                    throw Assert.unreachableCode();
-                }
-            }
-        }
         if (isShutdownInterrupt(newStatus) != isShutdownInterrupt(oldStatus)) {
             assert ! isShutdownInterrupt(oldStatus); // because it can only ever be set, not cleared
             // we initiated interrupt, so interrupt all currently active threads
@@ -995,6 +894,7 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
                 thread.interrupt();
             }
         }
+
         if (isShutdownComplete(newStatus) != isShutdownComplete(oldStatus)) {
             assert ! isShutdownComplete(oldStatus);  // because it can only ever be set, not cleared
             completeTermination();
@@ -1413,135 +1313,56 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
          */
         public void run() {
             final Thread currentThread = Thread.currentThread();
-            final Lock headLock = EnhancedQueueExecutor.this.headLock;
-            final LongAdder spinMisses = EnhancedQueueExecutor.this.spinMisses;
             runningThreads.add(currentThread);
 
             // run the initial task
             doRunTask(getAndClearInitialTask());
 
             // main loop
-            QNode node;
+            Runnable node = null;
             processingQueue: for (;;) {
-                if (HEAD_LOCK) {
-                    headLock.lock();
-                    try {
-                        node = getOrAddNode();
-                    } finally {
-                        headLock.unlock();
-                    }
-                } else {
-                    node = getOrAddNode();
+                long start = System.nanoTime();
+                try {
+                    node = queue.poll(timeoutNanos, TimeUnit.NANOSECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    //TODO: how is this supposed to be handled?
                 }
-                if (node instanceof TaskNode) {
+                boolean shutdown = node == SHUTDOWN;
+                if (shutdown) {
+                    //put if back for other threads.
+                    queue.add(SHUTDOWN);
+                }
+                if (node != null && !shutdown) {
                     // task node was removed
-                    doRunTask(((TaskNode) node).getAndClearTask());
+                    doRunTask(node);
                     continue;
-                } else if (node instanceof PoolThreadNode) {
+                } else {
+                    long elapsed = System.nanoTime() - start;
                     // pool thread node was added
-                    final PoolThreadNode newNode = (PoolThreadNode) node;
-                    // at this point, we are registered into the queue
-                    long start = System.nanoTime();
-                    long elapsed = 0L;
-                    waitingForTask: for (;;) {
-                        Runnable task = newNode.getTask();
-                        assert task != ACCEPTED && task != GAVE_UP;
-                        if (task != WAITING && task != EXIT) {
-                            if (newNode.compareAndSetTask(task, ACCEPTED)) {
-                                // we have a task to run, so run it and then abandon the node
-                                doRunTask(task);
-                                // rerun outer
-                                continue processingQueue;
-                            }
-                            // we had a task to run, but we failed to CAS it for some reason, so retry
-                            if (UPDATE_STATISTICS) spinMisses.increment();
-                            continue waitingForTask;
-                        } else {
-                            final long timeoutNanos = EnhancedQueueExecutor.this.timeoutNanos;
-                            long oldVal = threadStatus;
-                            if (elapsed >= timeoutNanos || task == EXIT || currentSizeOf(oldVal) > maxSizeOf(oldVal)) {
-                                // try to exit this thread, if we are allowed
-                                if (task == EXIT ||
-                                        isShutdownRequested(oldVal) ||
-                                        isAllowCoreTimeout(oldVal) ||
-                                        currentSizeOf(oldVal) > coreSizeOf(oldVal)
-                                        ) {
-                                    if (newNode.compareAndSetTask(task, GAVE_UP)) {
-                                        for (;;) {
-                                            if (tryDeallocateThread(oldVal)) {
-                                                // clear to exit.
-                                                runningThreads.remove(currentThread);
-                                                return;
-                                            }
-                                            if (UPDATE_STATISTICS) spinMisses.increment();
-                                            oldVal = threadStatus;
-                                        }
-                                        //throw Assert.unreachableCode();
-                                    }
-                                    continue waitingForTask;
-                                } else {
-                                    if (elapsed >= timeoutNanos) {
-                                        newNode.park(EnhancedQueueExecutor.this);
-                                    } else {
-                                        newNode.park(EnhancedQueueExecutor.this, timeoutNanos - elapsed);
-                                    }
-                                    Thread.interrupted();
-                                    elapsed = System.nanoTime() - start;
-                                    // retry inner
-                                    continue waitingForTask;
+
+                    long oldVal = threadStatus;
+                    if (shutdown || elapsed >= timeoutNanos || currentSizeOf(oldVal) > maxSizeOf(oldVal)) {
+                        // try to exit this thread, if we are allowed
+                        if (isShutdownRequested(oldVal) ||
+                                isAllowCoreTimeout(oldVal) ||
+                                currentSizeOf(oldVal) > coreSizeOf(oldVal)
+                        ) {
+                            for (; ; ) {
+                                if (tryDeallocateThread(oldVal)) {
+                                    // clear to exit.
+                                    runningThreads.remove(currentThread);
+                                    return;
                                 }
-                                //throw Assert.unreachableCode();
-                            } else {
-                                assert task == WAITING;
-                                newNode.park(EnhancedQueueExecutor.this, timeoutNanos - elapsed);
-                                Thread.interrupted();
-                                elapsed = System.nanoTime() - start;
-                                // retry inner
-                                continue waitingForTask;
+                                if (UPDATE_STATISTICS) spinMisses.increment();
+                                oldVal = threadStatus;
                             }
                             //throw Assert.unreachableCode();
                         }
                         //throw Assert.unreachableCode();
-                    } // :waitingForTask
-                    //throw Assert.unreachableCode();
-                } else {
-                    assert node instanceof TerminateWaiterNode;
-                    // we're shutting down!
-                    runningThreads.remove(currentThread);
-                    deallocateThread();
-                    return;
-                }
-                //throw Assert.unreachableCode();
-            } // :processingQueue
-            //throw Assert.unreachableCode();
-        }
+                    }
 
-        private QNode getOrAddNode() {
-            TaskNode head;
-            QNode headNext;
-            PoolThreadNode newNode = null;
-            for (;;) {
-                head = EnhancedQueueExecutor.this.head;
-                headNext = head.getNext();
-                if (headNext instanceof TaskNode) {
-                    TaskNode taskNode = (TaskNode) headNext;
-                    if (compareAndSetHead(head, taskNode)) {
-                        if (! NO_QUEUE_LIMIT) decreaseQueueSize();
-                        return taskNode;
-                    }
-                } else if (headNext instanceof PoolThreadNode || headNext == null) {
-                    if (newNode == null) {
-                        newNode = new PoolThreadNode(Thread.currentThread());
-                    }
-                    newNode.setNext(headNext);
-                    if (head.compareAndSetNext(headNext, newNode)) {
-                        return newNode;
-                    }
-                } else {
-                    assert headNext instanceof TerminateWaiterNode;
-                    return headNext;
                 }
-                if (UPDATE_STATISTICS) spinMisses.increment();
             }
         }
 
@@ -1645,7 +1466,6 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
      * @return {@code true} if the thread was deallocated, or {@code false} to retry with a new {@code oldStat}
      */
     boolean tryDeallocateThread(long oldStat) {
-        assert ! currentThreadHolds(headLock) && ! currentThreadHolds(tailLock);
         // roll back our thread allocation attempt
         // state change ex4:
         //   threadStatus.size ← threadStatus.size - 1
@@ -1671,7 +1491,6 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
      * @throws RejectedExecutionException if {@code runnable} is not {@code null} and the thread could not be created or started
      */
     boolean doStartThread(Runnable runnable) throws RejectedExecutionException {
-        assert ! currentThreadHolds(headLock) && ! currentThreadHolds(tailLock);
         Thread thread;
         try {
             thread = threadFactory.newThread(new ThreadBody(runnable));
@@ -1706,127 +1525,34 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
     // =======================================================
 
     private int tryExecute(final Runnable runnable) {
-        QNode tailNext;
-        TaskNode tail = this.tail;
-        final int result;
-        TaskNode node = null;
-        for (;;) {
-            tailNext = tail.getNext();
-            if (tailNext instanceof TaskNode) {
-                TaskNode tailNextTaskNode;
-                do {
-                    if (UPDATE_STATISTICS) spinMisses.increment();
-                    tailNextTaskNode = (TaskNode) tailNext;
-                    // retry
-                    tail = tailNextTaskNode;
-                    tailNext = tail.getNext();
-                } while (tailNext instanceof TaskNode);
-                // opportunistically update for the possible benefit of other threads
-                if (UPDATE_TAIL) compareAndSetTail(tail, tailNextTaskNode);
-            }
-            // we've progressed to the first non-task node, as far as we can see
-            assert ! (tailNext instanceof TaskNode);
-            if (tailNext instanceof PoolThreadNode) {
-                final QNode tailNextNext = tailNext.getNext();
-                // state change ex1:
-                //   tail(snapshot).next ← tail(snapshot).next(snapshot).next(snapshot)
-                // succeeds: -
-                // cannot succeed: sh2
-                // preconditions:
-                //   tail(snapshot) is a dead TaskNode
-                //   tail(snapshot).next is PoolThreadNode
-                //   tail(snapshot).next.next* is PoolThreadNode or null
-                // additional success postconditions: -
-                // failure postconditions: -
-                // post-actions (succeed):
-                //   run state change ex2
-                // post-actions (fail):
-                //   retry with new tail(snapshot)
-                if (tail.compareAndSetNext(tailNext, tailNextNext)) {
-                    PoolThreadNode consumerNode = (PoolThreadNode) tailNext;
-                    // state change ex2:
-                    //   tail(snapshot).next(snapshot).task ← runnable
-                    // succeeds: ex1
-                    // preconditions:
-                    //   tail(snapshot).next(snapshot).task = WAITING
-                    // post-actions (succeed):
-                    //   unpark thread and return
-                    // post-actions (fail):
-                    //   retry outer with new tail(snapshot)
-                    if (consumerNode.compareAndSetTask(WAITING, runnable)) {
-                        consumerNode.unpark();
-                        result = EXE_OK;
-                        break;
-                    }
-                    // otherwise the consumer gave up or was exited already, so fall out and...
-                }
-                // retry with new tail(snapshot) as was foretold
-                tail = this.tail;
-                if (UPDATE_STATISTICS) spinMisses.increment();
-            } else if (tailNext == null) {
-                // no consumers available; maybe we can start one
-                int tr = tryAllocateThread(growthResistance);
-                if (tr == AT_YES) {
-                    result = EXE_CREATE_THREAD;
-                    break;
-                }
-                if (tr == AT_SHUTDOWN) {
-                    result = EXE_REJECT_SHUTDOWN;
-                    break;
-                }
-                assert tr == AT_NO;
-                // no; try to enqueue
-                if (! NO_QUEUE_LIMIT && ! increaseQueueSize()) {
-                    // queue is full
-                    // OK last effort to create a thread, disregarding growth limit
-                    tr = tryAllocateThread(0.0f);
-                    if (tr == AT_YES) {
-                        result = EXE_CREATE_THREAD;
-                        break;
-                    }
-                    if (tr == AT_SHUTDOWN) {
-                        result = EXE_REJECT_SHUTDOWN;
-                        break;
-                    }
-                    assert tr == AT_NO;
-                    result = EXE_REJECT_QUEUE_FULL;
-                    break;
-                }
-                // queue size increased successfully; we can add to the list
-                if (node == null) {
-                    // avoid re-allocating TaskNode instances on subsequent iterations
-                    node = new TaskNode(runnable);
-                }
-                // state change ex5:
-                //   tail(snapshot).next ← new task node
-                // cannot succeed: sh2
-                // preconditions:
-                //   tail(snapshot).next = null
-                //   ex3 failed precondition
-                //   queue size increased to accommodate node
-                // postconditions (success):
-                //   tail(snapshot).next = new task node
-                if (tail.compareAndSetNext(null, node)) {
-                    // try to update tail to the new node; if this CAS fails then tail already points at past the node
-                    // this is because tail can only ever move forward, and the task list is always strongly connected
-                    compareAndSetTail(tail, node);
-                    result = EXE_OK;
-                    break;
-                }
-                // we failed; we have to drop the queue size back down again to compensate before we can retry
-                if (! NO_QUEUE_LIMIT) decreaseQueueSize();
-                // retry with new tail(snapshot)
-                tail = this.tail;
-                if (UPDATE_STATISTICS) spinMisses.increment();
-            } else {
-                // no consumers are waiting and the tail(snapshot).next node is non-null and not a task node, therefore it must be a...
-                assert tailNext instanceof TerminateWaiterNode;
-                // shutting down
-                result = EXE_REJECT_SHUTDOWN;
-                break;
-            }
+        if (queue.tryTransfer(runnable)) {
+            return EXE_OK;
         }
-        return result;
+        // no consumers available; maybe we can start one
+        int tr = tryAllocateThread(growthResistance);
+        if (tr == AT_YES) {
+            return EXE_CREATE_THREAD;
+        }
+        if (tr == AT_SHUTDOWN) {
+            return EXE_REJECT_SHUTDOWN;
+        }
+        // no; try to enqueue
+        if (!NO_QUEUE_LIMIT && !increaseQueueSize()) {
+            // queue is full
+            // OK last effort to create a thread, disregarding growth limit
+            tr = tryAllocateThread(0.0f);
+            if (tr == AT_YES) {
+                return EXE_CREATE_THREAD;
+            }
+            if (tr == AT_SHUTDOWN) {
+                return EXE_REJECT_SHUTDOWN;
+            }
+            assert tr == AT_NO;
+            return EXE_REJECT_QUEUE_FULL;
+        }
+        queue.offer(runnable);
+        return EXE_OK;
+
     }
 
     // =======================================================
@@ -1834,7 +1560,6 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
     // =======================================================
 
     void completeTermination() {
-        assert ! currentThreadHolds(headLock) && ! currentThreadHolds(tailLock);
         // be kind and un-interrupt the thread for the termination task
         Thread.interrupted();
         final Runnable terminationTask = this.terminationTask;
@@ -1846,7 +1571,6 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
             unpark(waiters.getThread());
             waiters = waiters.getNext();
         }
-        tail.setNext(TERMINATE_COMPLETE);
         if (! DISABLE_MBEAN) {
             final Object handle = this.handle;
             if (handle != null) {
@@ -2036,7 +1760,6 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
     // =======================================================
 
     void safeRun(final Runnable task) {
-        assert ! currentThreadHolds(headLock) && ! currentThreadHolds(tailLock);
         if (task == null) return;
         final Thread currentThread = Thread.currentThread();
         JBossExecutors.clearContextClassLoader(currentThread);
@@ -2088,181 +1811,6 @@ public final class EnhancedQueueExecutor extends EnhancedQueueExecutorBase6 impl
         } catch (Throwable t) {
             t.addSuppressed(new RejectedExecutionException("Executor is being shut down"));
             throw t;
-        }
-    }
-
-    // =======================================================
-    // Node classes
-    // =======================================================
-
-    abstract static class QNode {
-        private static final long nextOffset;
-
-        static {
-            try {
-                nextOffset = unsafe.objectFieldOffset(QNode.class.getDeclaredField("next"));
-            } catch (NoSuchFieldException e) {
-                throw new NoSuchFieldError(e.getMessage());
-            }
-        }
-
-        @SuppressWarnings("unused")
-        private volatile QNode next;
-
-        boolean compareAndSetNext(QNode expect, QNode update) {
-            return unsafe.compareAndSwapObject(this, nextOffset, expect, update);
-        }
-
-        QNode getNext() {
-            return next;
-        }
-
-        void setNext(final QNode node) {
-            next = node;
-        }
-    }
-
-    static final class PoolThreadNode extends QNode {
-
-        /**
-         * Thread is running normally.
-         */
-        private static final int STATE_NORMAL = 0;
-
-        /**
-         * Thread is parked (or about to park), and unpark call is necessary to wake the thread
-         */
-        private static final int STATE_PARKED = 1;
-
-        /**
-         * The thread has been unparked, any thread that is spinning or about to park will return,
-         * if not thread is currently spinning the next thread that attempts to spin will immediately return
-         */
-        private static final int STATE_UNPARKED = 2;
-
-
-        private static final long taskOffset;
-        private static final long parkedOffset;
-
-        static {
-            try {
-                taskOffset = unsafe.objectFieldOffset(PoolThreadNode.class.getDeclaredField("task"));
-                parkedOffset = unsafe.objectFieldOffset(PoolThreadNode.class.getDeclaredField("parked"));
-            } catch (NoSuchFieldException e) {
-                throw new NoSuchFieldError(e.getMessage());
-            }
-        }
-
-        private final Thread thread;
-
-        @SuppressWarnings("unused")
-        private volatile Runnable task;
-
-        /**
-         * The park state, see the STATE_ constants for the meanings of each value
-         */
-        @SuppressWarnings("unused")
-        private volatile int parked;
-
-        PoolThreadNode(final Thread thread) {
-            this.thread = thread;
-            task = WAITING;
-        }
-
-        boolean compareAndSetTask(final Runnable expect, final Runnable update) {
-            return unsafe.compareAndSwapObject(this, taskOffset, expect, update);
-        }
-
-        Runnable getTask() {
-            return task;
-        }
-
-        PoolThreadNode getNext() {
-            return (PoolThreadNode) super.getNext();
-        }
-
-        void park(EnhancedQueueExecutor enhancedQueueExecutor) {
-            int spins = PARK_SPINS;
-            if (spins > 0) {
-                ThreadLocalRandom tl = ThreadLocalRandom.current();
-                do {
-                    if (tl.nextInt(PARK_SPINS) < YIELD_FACTOR) {
-                        Thread.yield();
-                    }
-                    if (unsafe.compareAndSwapInt(this, parkedOffset, STATE_UNPARKED, STATE_NORMAL)) {
-                        return;
-                    }
-                    spins--;
-                } while (spins > 0);
-            }
-            try {
-                if (unsafe.compareAndSwapInt(this, parkedOffset, STATE_NORMAL, STATE_PARKED)) {
-                    LockSupport.park(enhancedQueueExecutor);
-                }
-            } finally {
-                unsafe.compareAndSwapInt(this, parkedOffset, STATE_PARKED, STATE_NORMAL);
-            }
-        }
-        void park(EnhancedQueueExecutor enhancedQueueExecutor, long nanos) {
-            long remaining;
-            int spins = PARK_SPINS;
-            if (spins > 0) {
-                long start = System.nanoTime();
-                ThreadLocalRandom tl = ThreadLocalRandom.current();
-                //note that we don't check the nanotime while spinning
-                //as spin time is short and for our use cases it does not matter if the time
-                //overruns a bit (as the nano time is for thread timeout) we just spin then check
-                //to keep performance consistent between the two versions.
-                do {
-                    if (tl.nextInt(PARK_SPINS) < YIELD_FACTOR) {
-                        Thread.yield();
-                    }
-                    if (unsafe.compareAndSwapInt(this, parkedOffset, STATE_UNPARKED, STATE_NORMAL)) {
-                        return;
-                    }
-                    spins--;
-                } while (spins > 0);
-                remaining = nanos - (System.nanoTime() - start);
-                if (remaining < 0) {
-                    return;
-                }
-            } else {
-                remaining = nanos;
-            }
-            try {
-                if (unsafe.compareAndSwapInt(this, parkedOffset, STATE_NORMAL, STATE_PARKED)) {
-                    LockSupport.parkNanos(enhancedQueueExecutor, remaining);
-                }
-            } finally {
-                unsafe.compareAndSwapInt(this, parkedOffset, STATE_PARKED, STATE_NORMAL);
-            }
-        }
-
-        void unpark() {
-            if (unsafe.compareAndSwapInt(this, parkedOffset, STATE_NORMAL, STATE_UNPARKED)) {
-                return;
-            }
-            LockSupport.unpark(thread);
-        }
-    }
-
-    static final class TerminateWaiterNode extends QNode {
-    }
-
-    static final class TaskNode extends QNode {
-        volatile Runnable task;
-
-        TaskNode(final Runnable task) {
-            // we always start task nodes with a {@code null} next
-            this.task = task;
-        }
-
-        Runnable getAndClearTask() {
-            try {
-                return task;
-            } finally {
-                this.task = null;
-            }
         }
     }
 
